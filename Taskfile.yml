@@ -1,0 +1,61 @@
+version: '3'
+
+vars:
+  CC:
+    sh: |
+      if [ -x "/ucrt64/bin/gcc" ]; then
+        echo "/ucrt64/bin/gcc"
+      elif [ -x "/mingw64/bin/gcc" ]; then
+        echo "/mingw64/bin/gcc"
+      elif command -v gcc >/dev/null 2>&1; then
+        echo "gcc"
+      else
+        echo "x86_64-w64-mingw32-gcc"
+      fi
+  CFLAGS: -std=c99 -Wall -Wextra -O2 -pthread -Isrc
+  # Platform-specific flags will be handled in cmds via OS template
+
+tasks:
+  build:
+    desc: 编译 EasyNet
+    cmds:
+      - >
+        {{.CC}} src/main.c src/net_common.c src/threading.c
+        {{.CFLAGS}}
+        {{if eq OS "windows"}}-D_WIN32_WINNT=0x0600 -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive{{end}}
+        -o easynet
+        {{if eq OS "windows"}}-lws2_32{{end}}
+    sources:
+      - src/*.c
+      - src/*.h
+    generates:
+      - easynet{{if eq OS "windows"}}.exe{{end}}
+
+  build-static:
+    desc: 静态链接编译（Windows 发布用，不依赖 libwinpthread-1.dll）
+    cmds:
+      - '{{.CC}} src/main.c src/net_common.c src/threading.c {{.CFLAGS}} {{if eq OS "windows"}}-D_WIN32_WINNT=0x0600{{end}} -static -o easynet {{if eq OS "windows"}}-lws2_32{{end}}'
+
+  run-server:
+    desc: 运行服务端（调试用）
+    deps: [build]
+    cmds:
+      - ./easynet -c server.toml
+
+  run-client:
+    desc: 运行客户端（调试用）
+    deps: [build]
+    cmds:
+      - ./easynet -c client.toml
+
+  clean:
+    desc: 清理编译产物
+    cmds:
+      - rm -f easynet{{if eq OS "windows"}}.exe{{end}}
+
+  test:
+    desc: 运行单元测试
+    dir: tests
+    cmds:
+      - task: build
+      - ./run_tests.sh
