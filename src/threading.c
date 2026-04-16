@@ -12,7 +12,7 @@ struct cond_t {
     pthread_cond_t cnd;
 };
 
-#define TASK_QUEUE_SIZE 256
+#define TASK_QUEUE_SIZE 1024
 
 struct task_queue_t {
     task_t buffer[TASK_QUEUE_SIZE];
@@ -22,6 +22,7 @@ struct task_queue_t {
     int exit_flag;
     pthread_mutex_t mtx;
     pthread_cond_t cnd;
+    pthread_cond_t cnd_full;
 };
 
 /* Thread */
@@ -108,6 +109,12 @@ task_queue_t *task_queue_create(void)
         free(q);
         return NULL;
     }
+    if (pthread_cond_init(&q->cnd_full, NULL) != 0) {
+        pthread_cond_destroy(&q->cnd);
+        pthread_mutex_destroy(&q->mtx);
+        free(q);
+        return NULL;
+    }
     return q;
 }
 
@@ -116,6 +123,7 @@ void task_queue_destroy(task_queue_t *q)
     if (!q) return;
     pthread_mutex_destroy(&q->mtx);
     pthread_cond_destroy(&q->cnd);
+    pthread_cond_destroy(&q->cnd_full);
     free(q);
 }
 
@@ -123,12 +131,17 @@ void task_queue_push(task_queue_t *q, const task_t *task)
 {
     if (!q || !task) return;
     pthread_mutex_lock(&q->mtx);
-    if (q->count < TASK_QUEUE_SIZE) {
-        q->buffer[q->tail] = *task;
-        q->tail = (q->tail + 1) % TASK_QUEUE_SIZE;
-        q->count++;
-        pthread_cond_signal(&q->cnd);
+    while (q->count >= TASK_QUEUE_SIZE && !q->exit_flag) {
+        pthread_cond_wait(&q->cnd_full, &q->mtx);
     }
+    if (q->exit_flag) {
+        pthread_mutex_unlock(&q->mtx);
+        return;
+    }
+    q->buffer[q->tail] = *task;
+    q->tail = (q->tail + 1) % TASK_QUEUE_SIZE;
+    q->count++;
+    pthread_cond_signal(&q->cnd);
     pthread_mutex_unlock(&q->mtx);
 }
 
@@ -165,6 +178,7 @@ int task_queue_pop(task_queue_t *q, task_t *out, int timeout_ms)
     *out = q->buffer[q->head];
     q->head = (q->head + 1) % TASK_QUEUE_SIZE;
     q->count--;
+    pthread_cond_signal(&q->cnd_full);
     pthread_mutex_unlock(&q->mtx);
     return 0;
 }
@@ -175,5 +189,6 @@ void task_queue_set_exit(task_queue_t *q)
     pthread_mutex_lock(&q->mtx);
     q->exit_flag = 1;
     pthread_cond_broadcast(&q->cnd);
+    pthread_cond_broadcast(&q->cnd_full);
     pthread_mutex_unlock(&q->mtx);
 }

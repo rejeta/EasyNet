@@ -8,6 +8,15 @@
 #define MAX_PAYLOAD_LEN 1300
 #define PACKET_OVERHEAD (NONCE_SIZE + TAG_SIZE)
 
+/* Payload formats:
+ * MSG_REGISTER:     [auth_token:32][client_id:32][tunnel_count:1]
+ *                   for each tunnel: [protocol:1][local_port:2][remote_port:2]
+ * MSG_REGISTER_ACK: (empty)
+ * MSG_HEARTBEAT:    (empty)
+ * MSG_SESSION_OPEN: [remote_port:2] (big-endian)
+ * MSG_SESSION_CLOSE: (empty)
+ * MSG_SESSION_DATA: raw bytes
+ */
 typedef enum {
     MSG_REGISTER = 0x01,
     MSG_REGISTER_ACK = 0x02,
