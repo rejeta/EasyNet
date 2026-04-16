@@ -7,6 +7,8 @@ vars:
         echo "/ucrt64/bin/gcc"
       elif [ -x "/mingw64/bin/gcc" ]; then
         echo "/mingw64/bin/gcc"
+      elif [ -x "/c/Users/Marcu/Documents/Program/msys/ucrt64/bin/gcc" ]; then
+        echo "/c/Users/Marcu/Documents/Program/msys/ucrt64/bin/gcc"
       elif command -v gcc >/dev/null 2>&1; then
         echo "gcc"
       else
@@ -20,11 +22,11 @@ tasks:
     desc: 编译 EasyNet
     cmds:
       - >
-        {{.CC}} src/main.c src/net_common.c src/threading.c
+        {{.CC}} src/main.c src/net_common.c src/threading.c src/config.c src/crypto.c src/toml.c src/monocypher.c
         {{.CFLAGS}}
         {{if eq OS "windows"}}-D_WIN32_WINNT=0x0600 -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive{{end}}
         -o easynet
-        {{if eq OS "windows"}}-lws2_32{{end}}
+        {{if eq OS "windows"}}-lws2_32 -lbcrypt{{end}}
     sources:
       - src/*.c
       - src/*.h

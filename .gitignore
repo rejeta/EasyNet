@@ -1,3 +1,4 @@
 document
 *.exe
 .task
+*.toml

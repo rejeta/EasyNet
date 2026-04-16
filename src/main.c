@@ -4,39 +4,60 @@
 
 #include "net_common.h"
 #include "threading.h"
-
-#ifdef _WIN32
-    #include <windows.h>
-#else
-    #include <unistd.h>
-    #include <time.h>
-#endif
-
-static volatile int g_running = 1;
+#include "config.h"
+#include "crypto.h"
 
 static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s -c <config.toml>\n", prog);
 }
 
-/* Phase 1 smoke test: create UDP + TCP listen, poll loop with worker thread */
-static void *worker_thread(void *arg)
+static int self_test_crypto(const crypto_keys_t *keys)
 {
-    task_queue_t *q = (task_queue_t *)arg;
-    task_t task;
+    const char *plaintext = "Hello, EasyNet! This is a crypto self-test.";
+    size_t len = strlen(plaintext);
+    uint8_t ciphertext[256];
+    uint8_t decrypted[256];
+    uint8_t tag[TAG_SIZE];
+    uint8_t nonce[NONCE_SIZE];
 
-    printf("[worker] started\n");
-    fflush(stdout);
-    while (1) {
-        int rc = task_queue_pop(q, &task, 100);
-        if (rc == 0) {
-            printf("[worker] got task type=%d session=%u len=%zu\n",
-                   (int)task.type, task.session_id, task.len);
-            fflush(stdout);
-        }
+    crypto_random_nonce(nonce);
+
+    if (crypto_encrypt(keys->enc_key, nonce,
+                       (const uint8_t *)plaintext, len,
+                       NULL, 0,
+                       ciphertext, tag) != 0) {
+        fprintf(stderr, "[self_test] encrypt failed\n");
+        return -1;
     }
-    printf("[worker] exiting\n");
-    return NULL;
+
+    if (crypto_decrypt(keys->enc_key, nonce,
+                       ciphertext, len,
+                       tag,
+                       NULL, 0,
+                       decrypted) != 0) {
+        fprintf(stderr, "[self_test] decrypt failed\n");
+        return -1;
+    }
+
+    if (memcmp(plaintext, decrypted, len) != 0) {
+        fprintf(stderr, "[self_test] plaintext mismatch\n");
+        return -1;
+    }
+
+    /* Tamper with ciphertext, expect decrypt to fail */
+    ciphertext[0] ^= 0xFF;
+    if (crypto_decrypt(keys->enc_key, nonce,
+                       ciphertext, len,
+                       tag,
+                       NULL, 0,
+                       decrypted) == 0) {
+        fprintf(stderr, "[self_test] tampered data should have failed decrypt\n");
+        return -1;
+    }
+
+    printf("[self_test] crypto OK\n");
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -44,7 +65,6 @@ int main(int argc, char *argv[])
     const char *config_file = "easynet.toml";
     int i;
 
-    /* Disable buffering so we see output even if the process crashes early */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -63,120 +83,44 @@ int main(int argc, char *argv[])
 
     printf("[main] config: %s\n", config_file);
 
-    if (net_init() != 0) {
-        fprintf(stderr, "[main] net_init failed\n");
+    app_config_t cfg;
+    if (config_load(config_file, &cfg) != 0) {
         return 1;
     }
 
-    /* Smoke test sockets */
-    socket_t udp_fd = net_udp_socket("0.0.0.0", 17000);
-    if (udp_fd == NET_INVALID_SOCKET) {
-        fprintf(stderr, "[main] failed to create UDP socket\n");
-        net_cleanup();
-        return 1;
-    }
-
-    socket_t tcp_fd = net_tcp_listen("0.0.0.0", 18080);
-    if (tcp_fd == NET_INVALID_SOCKET) {
-        fprintf(stderr, "[main] failed to create TCP listen socket\n");
-        closesocket(udp_fd);
-        net_cleanup();
-        return 1;
-    }
-
-    if (net_set_nonblocking(udp_fd) != 0 || net_set_nonblocking(tcp_fd) != 0) {
-        fprintf(stderr, "[main] failed to set nonblocking\n");
-        closesocket(tcp_fd);
-        closesocket(udp_fd);
-        net_cleanup();
-        return 1;
-    }
-
-    task_queue_t *q = task_queue_create();
-    if (!q) {
-        fprintf(stderr, "[main] failed to create task queue\n");
-        closesocket(tcp_fd);
-        closesocket(udp_fd);
-        net_cleanup();
-        return 1;
-    }
-
-    if (thread_create(worker_thread, q) != 0) {
-        fprintf(stderr, "[main] failed to create worker thread\n");
-        task_queue_destroy(q);
-        closesocket(tcp_fd);
-        closesocket(udp_fd);
-        net_cleanup();
-        return 1;
-    }
-
-    struct pollfd fds[2];
-    fds[0].fd = udp_fd;
-    fds[0].events = POLLIN;
-    fds[1].fd = tcp_fd;
-    fds[1].events = POLLIN;
-
-    printf("[main] entering poll loop (Ctrl+C to exit)...\n");
-
-    int loop_count = 0;
-    while (g_running && loop_count < 100) {
-        int rc = net_poll(fds, 2, 100);
-        if (rc < 0) {
-            fprintf(stderr, "[main] poll error\n");
-            break;
+    printf("[main] mode: %s\n", cfg.is_server ? "server" : "client");
+    if (!cfg.is_server) {
+        printf("[main] server: %s:%u\n", cfg.server_addr, cfg.server_port);
+        printf("[main] tunnels: %d\n", cfg.tunnel_count);
+        for (i = 0; i < cfg.tunnel_count; i++) {
+            printf("[main]   tunnel %d: %s:%u -> remote:%u (%s)\n",
+                   i,
+                   cfg.tunnels[i].local_addr,
+                   cfg.tunnels[i].local_port,
+                   cfg.tunnels[i].remote_port,
+                   cfg.tunnels[i].protocol == PROTO_UDP ? "udp" : "tcp");
         }
-
-        /* UDP readable */
-        if (fds[0].revents & POLLIN) {
-            char buf[4096];
-            net_addr_t from;
-            int ret = recvfrom(udp_fd, buf, sizeof(buf), 0,
-                               (struct sockaddr *)&from.ss, &from.len);
-            if (ret > 0) {
-                char addrbuf[64];
-                printf("[main] UDP recv %d bytes from %s\n",
-                       ret, net_addr_str(&from, addrbuf, sizeof(addrbuf)));
-                task_t task;
-                memset(&task, 0, sizeof(task));
-                task.type = TASK_ENCRYPT_AND_SEND;
-                task.session_id = 0;
-                task.len = (size_t)ret;
-                if (task.len > sizeof(task.data)) task.len = sizeof(task.data);
-                memcpy(task.data, buf, task.len);
-                task.udp_dest = from;
-                task_queue_push(q, &task);
-            }
-        }
-
-        /* TCP accept */
-        if (fds[1].revents & POLLIN) {
-            net_addr_t client_addr;
-            socket_t client_fd = accept(tcp_fd, (struct sockaddr *)&client_addr.ss, &client_addr.len);
-            if (client_fd != NET_INVALID_SOCKET) {
-                char addrbuf[64];
-                printf("[main] TCP accepted from %s\n",
-                       net_addr_str(&client_addr, addrbuf, sizeof(addrbuf)));
-                closesocket(client_fd);
-            }
-        }
-
-        loop_count++;
+    } else {
+        printf("[main] bind: %s:%u\n", cfg.bind_addr, cfg.bind_port);
     }
 
-    printf("[main] exiting poll loop\n");
+    crypto_keys_t keys;
+    crypto_derive_keys(cfg.password, strlen(cfg.password), &keys);
 
-    task_queue_set_exit(q);
-    /* Give worker a moment to see exit flag. In real code we'd join the thread. */
-#ifdef _WIN32
-    Sleep(200);
-#else
-    struct timespec ts = {0, 200000000L};
-    nanosleep(&ts, NULL);
-#endif
+    /* Verify key derivation is deterministic */
+    crypto_keys_t keys2;
+    crypto_derive_keys(cfg.password, strlen(cfg.password), &keys2);
+    if (memcmp(&keys, &keys2, sizeof(keys)) != 0) {
+        fprintf(stderr, "[main] key derivation is not deterministic!\n");
+        return 1;
+    }
+    memset(&keys2, 0, sizeof(keys2));
 
-    task_queue_destroy(q);
-    closesocket(tcp_fd);
-    closesocket(udp_fd);
-    net_cleanup();
+    if (self_test_crypto(&keys) != 0) {
+        fprintf(stderr, "[main] crypto self-test failed\n");
+        return 1;
+    }
+
+    printf("[main] Phase 2 initialization complete. Ready for Phase 3.\n");
     return 0;
 }
