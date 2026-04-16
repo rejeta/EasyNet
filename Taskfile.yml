@@ -22,7 +22,7 @@ tasks:
     desc: 编译 EasyNet
     cmds:
       - >
-        {{.CC}} src/main.c src/net_common.c src/threading.c src/config.c src/crypto.c src/toml.c src/monocypher.c
+        {{.CC}} src/main.c src/net_common.c src/threading.c src/config.c src/crypto.c src/protocol.c src/session.c src/client.c src/server.c src/toml.c src/monocypher.c
         {{.CFLAGS}}
         {{if eq OS "windows"}}-D_WIN32_WINNT=0x0600 -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive{{end}}
         -o easynet
