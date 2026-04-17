@@ -12,7 +12,7 @@ struct cond_t {
     pthread_cond_t cnd;
 };
 
-#define TASK_QUEUE_SIZE 1024
+#define TASK_QUEUE_SIZE 8192
 
 struct task_queue_t {
     task_t buffer[TASK_QUEUE_SIZE];

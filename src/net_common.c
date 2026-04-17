@@ -3,6 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+    #include <netinet/tcp.h>
+#endif
+
 #ifdef _WIN32
 static int g_wsa_initialized = 0;
 #endif
@@ -115,6 +119,22 @@ socket_t net_tcp_connect(const char *addr, uint16_t port)
     return fd;
 }
 
+void net_tcp_tune(socket_t fd)
+{
+    int nodelay = 1;
+    int sndbuf = 262144;
+    int rcvbuf = 262144;
+#ifdef _WIN32
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+#else
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#endif
+}
+
 int net_set_nonblocking(socket_t fd)
 {
 #ifdef _WIN32
@@ -184,5 +204,14 @@ int net_error(void)
     return WSAGetLastError();
 #else
     return errno;
+#endif
+}
+
+int net_would_block(int err)
+{
+#ifdef _WIN32
+    return err == WSAEWOULDBLOCK;
+#else
+    return err == EWOULDBLOCK;
 #endif
 }

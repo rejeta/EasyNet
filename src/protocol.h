@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include "crypto.h"
 
-#define MAX_PAYLOAD_LEN 1300
+#define MAX_PAYLOAD_LEN 1400
 #define PACKET_OVERHEAD (NONCE_SIZE + TAG_SIZE)
 
 /* Payload formats:
@@ -23,7 +23,8 @@ typedef enum {
     MSG_HEARTBEAT = 0x03,
     MSG_SESSION_OPEN = 0x04,
     MSG_SESSION_CLOSE = 0x05,
-    MSG_SESSION_DATA = 0x06
+    MSG_SESSION_DATA = 0x06,
+    MSG_SESSION_ACK = 0x07
 } msg_type_t;
 
 typedef struct {

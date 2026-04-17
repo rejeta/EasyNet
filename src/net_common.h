@@ -38,10 +38,12 @@ void net_cleanup(void);
 socket_t net_udp_socket(const char *bind_addr, uint16_t port);
 socket_t net_tcp_listen(const char *bind_addr, uint16_t port);
 socket_t net_tcp_connect(const char *addr, uint16_t port);
+void net_tcp_tune(socket_t fd);
 int net_set_nonblocking(socket_t fd);
 int net_poll(struct pollfd *fds, int nfds, int timeout_ms);
 int net_addr_parse(const char *addr, uint16_t port, net_addr_t *out);
 const char *net_addr_str(const net_addr_t *addr, char *buf, size_t buflen);
 int net_error(void);
+int net_would_block(int err);
 
 #endif

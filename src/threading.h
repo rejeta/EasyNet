@@ -34,6 +34,7 @@ typedef enum {
 typedef struct {
     task_type_t type;
     uint32_t session_id;
+    uint16_t seq;             /* ARQ 序列号（仅 SESSION_DATA 有效） */
     char data[4096];
     size_t len;
     net_addr_t udp_dest;

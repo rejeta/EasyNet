@@ -18,7 +18,7 @@ void *worker_thread(void *arg)
             msg_t msg;
             msg.type = MSG_SESSION_DATA;
             msg.session_id = task.session_id;
-            msg.seq = 0;
+            msg.seq = task.seq;
             msg.payload = (const uint8_t *)task.data;
             msg.payload_len = task.len;
 
@@ -40,7 +40,10 @@ void *worker_thread(void *arg)
             int n = sendto(ctx->udp_fd, (const char *)packet, (int)packet_len, 0,
                            (const struct sockaddr *)&task.udp_dest.ss, task.udp_dest.len);
             if (n != (int)packet_len) {
-                fprintf(stderr, "[worker] sendto failed\n");
+                fprintf(stderr, "[worker] sendto failed: sent %d/%zu err=%d\n", n, packet_len, net_error());
+            } else {
+                fprintf(stderr, "[worker] sent SESSION_DATA session=%u seq=%u len=%zu\n",
+                        msg.session_id, msg.seq, msg.payload_len);
             }
         } else if (task.type == TASK_DECRYPT_AND_WRITE) {
             /* Push back to queue as TASK_SEND_TCP so main thread handles blocking TCP send */

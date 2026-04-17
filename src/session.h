@@ -5,6 +5,11 @@
 #include <stdint.h>
 
 #define MAX_SESSIONS 256
+#define SEND_WND_SIZE 32
+#define RECV_WND_SIZE 32
+#define MAX_PAYLOAD_LEN 1400
+#define RETRANSMIT_TIMEOUT_MS 400
+#define MAX_RETRANSMIT_RETRIES 10
 
 typedef enum {
     SESS_STATE_IDLE = 0,
@@ -12,6 +17,21 @@ typedef enum {
     SESS_STATE_ESTABLISHED,
     SESS_STATE_CLOSING
 } session_state_t;
+
+typedef struct {
+    uint16_t seq;
+    uint8_t payload[MAX_PAYLOAD_LEN];
+    size_t len;
+    uint64_t send_time_ms;
+    int retries;
+} send_wnd_pkt_t;
+
+typedef struct {
+    uint16_t seq;
+    uint8_t payload[MAX_PAYLOAD_LEN];
+    size_t len;
+    int valid;
+} recv_wnd_slot_t;
 
 typedef struct {
     uint32_t id;
@@ -24,6 +44,13 @@ typedef struct {
     uint8_t tx_buf[8192];
     size_t tx_len;
     size_t tx_off;
+
+    /* ARQ 新增 */
+    uint16_t tx_next_seq;
+    uint16_t rx_next_seq;
+    send_wnd_pkt_t send_pkts[SEND_WND_SIZE];
+    int send_pkt_count;
+    recv_wnd_slot_t recv_slots[RECV_WND_SIZE];
 } session_t;
 
 typedef struct {
