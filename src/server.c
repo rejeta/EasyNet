@@ -144,31 +144,51 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
 
     client_entry_t clients[MAX_CLIENTS];
     listen_entry_t listens[MAX_LISTENS];
-    session_pool_t sessions;
+    session_pool_t *sessions = (session_pool_t *)malloc(sizeof(session_pool_t));
+    if (!sessions) {
+        fprintf(stderr, "[server] failed to allocate session pool\n");
+        closesocket(udp_fd);
+        return 1;
+    }
     memset(clients, 0, sizeof(clients));
     memset(listens, 0, sizeof(listens));
-    session_pool_init(&sessions);
+    session_pool_init(sessions);
 
     task_queue_t *q = task_queue_create();
     if (!q) {
         fprintf(stderr, "[server] failed to create task queue\n");
+        free(sessions);
+        closesocket(udp_fd);
+        return 1;
+    }
+
+    task_queue_t *send_q = task_queue_create();
+    if (!send_q) {
+        fprintf(stderr, "[server] failed to create send queue\n");
+        task_queue_destroy(q);
+        free(sessions);
         closesocket(udp_fd);
         return 1;
     }
 
     worker_ctx_t *wctx = (worker_ctx_t *)malloc(sizeof(worker_ctx_t));
     if (!wctx) {
+        task_queue_destroy(send_q);
         task_queue_destroy(q);
+        free(sessions);
         closesocket(udp_fd);
         return 1;
     }
     wctx->queue = q;
+    wctx->send_q = send_q;
     wctx->keys = keys;
     wctx->udp_fd = udp_fd;
     if (thread_create(worker_thread, wctx) != 0) {
         fprintf(stderr, "[server] failed to create worker thread\n");
         free(wctx);
+        task_queue_destroy(send_q);
         task_queue_destroy(q);
+        free(sessions);
         closesocket(udp_fd);
         return 1;
     }
@@ -194,10 +214,49 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
         }
 
         for (int i = 0; i < MAX_SESSIONS; i++) {
-            if (sessions.items[i].state == SESS_STATE_ESTABLISHED) {
-                fds[nfds].fd = sessions.items[i].local_fd;
+            if (sessions->items[i].state == SESS_STATE_ESTABLISHED) {
+                fds[nfds].fd = sessions->items[i].local_fd;
                 fds[nfds].events = POLLIN;
+                if (sessions->items[i].tx_len > 0) {
+                    fds[nfds].events |= POLLOUT;
+                }
                 nfds++;
+            }
+        }
+
+        /* Drain TCP send tasks from worker before poll */
+        for (int i = 0; i < 10; i++) {
+            task_t task;
+            if (task_queue_pop(send_q, &task, 0) != 0) break;
+            session_t *s = session_find(sessions, task.session_id);
+            if (!s || s->state != SESS_STATE_ESTABLISHED || s->local_fd == NET_INVALID_SOCKET) continue;
+            size_t sent = 0;
+            while (sent < task.len) {
+                int n = send(s->local_fd, task.data + sent, (int)(task.len - sent), 0);
+                if (n > 0) {
+                    sent += (size_t)n;
+                } else {
+                    int err = net_error();
+                    if (n < 0 && err == EWOULDBLOCK) {
+                        size_t remain = task.len - sent;
+                        if (remain > sizeof(s->tx_buf)) remain = sizeof(s->tx_buf);
+                        memcpy(s->tx_buf, task.data + sent, remain);
+                        s->tx_len = remain;
+                        s->tx_off = 0;
+                        break;
+                    } else {
+                        fprintf(stderr, "[server] session %u tcp send error\n", s->id);
+                        msg_t close_msg;
+                        close_msg.type = MSG_SESSION_CLOSE;
+                        close_msg.session_id = s->id;
+                        close_msg.seq = 0;
+                        close_msg.payload = NULL;
+                        close_msg.payload_len = 0;
+                        send_msg(udp_fd, &s->peer_addr, keys, &close_msg);
+                        session_free(sessions, s);
+                        break;
+                    }
+                }
             }
         }
 
@@ -210,7 +269,7 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
         uint64_t now = get_time_ms();
 
         for (int i = 0; i < nfds; i++) {
-            if (!(fds[i].revents & POLLIN)) continue;
+            if (!(fds[i].revents & (POLLIN | POLLOUT))) continue;
 
             if (fds[i].fd == udp_fd) {
                 uint8_t packet[1500];
@@ -293,13 +352,13 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
                         fprintf(stderr, "[server] heartbeat from %s\n", c->client_id);
                     }
                 } else if (msg.type == MSG_SESSION_CLOSE) {
-                    session_t *s = session_find(&sessions, msg.session_id);
+                    session_t *s = session_find(sessions, msg.session_id);
                     if (s) {
                         fprintf(stderr, "[server] session %u closed by client\n", msg.session_id);
-                        session_free(&sessions, s);
+                        session_free(sessions, s);
                     }
                 } else if (msg.type == MSG_SESSION_DATA) {
-                    session_t *s = session_find(&sessions, msg.session_id);
+                    session_t *s = session_find(sessions, msg.session_id);
                     if (s && s->state == SESS_STATE_ESTABLISHED) {
                         task_t task;
                         memset(&task, 0, sizeof(task));
@@ -322,7 +381,7 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
                     socket_t client_fd = accept(fds[i].fd, (struct sockaddr *)&client_addr.ss, &client_addr.len);
                     if (client_fd != NET_INVALID_SOCKET) {
                         net_set_nonblocking(client_fd);
-                        session_t *s = session_alloc(&sessions);
+                        session_t *s = session_alloc(sessions);
                         if (s) {
                             s->local_fd = client_fd;
                             s->tunnel_fd = udp_fd;
@@ -348,11 +407,40 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
                     }
                 } else {
                     /* Must be client TCP data */
-                    session_t *s = find_session_by_fd(&sessions, fds[i].fd);
+                    session_t *s = find_session_by_fd(sessions, fds[i].fd);
                     if (s) {
-                        char buf[MAX_PAYLOAD_LEN];
-                        int n = recv(fds[i].fd, buf, sizeof(buf), 0);
-                        if (n > 0) {
+                        if (fds[i].revents & POLLOUT) {
+                            while (s->tx_len > 0) {
+                                int n = send(s->local_fd, (char *)(s->tx_buf + s->tx_off), (int)s->tx_len, 0);
+                                if (n > 0) {
+                                    s->tx_off += (size_t)n;
+                                    s->tx_len -= (size_t)n;
+                                } else {
+                                    int err = net_error();
+                                    if (n < 0 && err == EWOULDBLOCK) {
+                                        break;
+                                    } else {
+                                        fprintf(stderr, "[server] session %u tcp send error (buffered)\n", s->id);
+                                        msg_t close_msg;
+                                        close_msg.type = MSG_SESSION_CLOSE;
+                                        close_msg.session_id = s->id;
+                                        close_msg.seq = 0;
+                                        close_msg.payload = NULL;
+                                        close_msg.payload_len = 0;
+                                        send_msg(udp_fd, &s->peer_addr, keys, &close_msg);
+                                        session_free(sessions, s);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (s && s->state == SESS_STATE_ESTABLISHED && s->tx_len == 0) {
+                                s->tx_off = 0;
+                            }
+                        }
+                        if (s && s->state == SESS_STATE_ESTABLISHED && (fds[i].revents & POLLIN)) {
+                            char buf[MAX_PAYLOAD_LEN];
+                            int n = recv(fds[i].fd, buf, sizeof(buf), 0);
+                            if (n > 0) {
                             s->last_active_ms = now;
                             task_t task;
                             memset(&task, 0, sizeof(task));
@@ -363,7 +451,7 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
                             task.udp_dest = s->peer_addr;
                             task.tcp_fd = NET_INVALID_SOCKET;
                             task_queue_push(q, &task);
-                        } else if (n == 0 || (n < 0 && net_error() != WSAEWOULDBLOCK && net_error() != EWOULDBLOCK)) {
+                        } else if (n == 0 || (n < 0 && net_error() != EWOULDBLOCK)) {
                             fprintf(stderr, "[server] session %u disconnected\n", s->id);
                             msg_t close_msg;
                             close_msg.type = MSG_SESSION_CLOSE;
@@ -372,8 +460,9 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
                             close_msg.payload = NULL;
                             close_msg.payload_len = 0;
                             send_msg(udp_fd, &s->peer_addr, keys, &close_msg);
-                            session_free(&sessions, s);
+                            session_free(sessions, s);
                         }
+                    }
                     }
                 }
             }
@@ -390,6 +479,7 @@ int server_run(const app_config_t *cfg, const crypto_keys_t *keys)
         }
     }
 
+    free(sessions);
     closesocket(udp_fd);
     return 0;
 }

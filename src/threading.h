@@ -27,7 +27,8 @@ typedef struct task_queue_t task_queue_t;
 
 typedef enum {
     TASK_ENCRYPT_AND_SEND,
-    TASK_DECRYPT_AND_WRITE
+    TASK_DECRYPT_AND_WRITE,
+    TASK_SEND_TCP
 } task_type_t;
 
 typedef struct {

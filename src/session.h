@@ -21,6 +21,9 @@ typedef struct {
     net_addr_t peer_addr;
     uint64_t last_active_ms;
     uint16_t remote_port;
+    uint8_t tx_buf[8192];
+    size_t tx_len;
+    size_t tx_off;
 } session_t;
 
 typedef struct {

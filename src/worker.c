@@ -43,11 +43,15 @@ void *worker_thread(void *arg)
                 fprintf(stderr, "[worker] sendto failed\n");
             }
         } else if (task.type == TASK_DECRYPT_AND_WRITE) {
-            /* Main thread already decrypted the UDP packet; worker only needs to write to TCP */
-            int n = send(task.tcp_fd, task.data, (int)task.len, 0);
-            if (n != (int)task.len) {
-                fprintf(stderr, "[worker] tcp send failed\n");
-            }
+            /* Push back to queue as TASK_SEND_TCP so main thread handles blocking TCP send */
+            task_t out;
+            memset(&out, 0, sizeof(out));
+            out.type = TASK_SEND_TCP;
+            out.session_id = task.session_id;
+            out.tcp_fd = task.tcp_fd;
+            out.len = task.len;
+            memcpy(out.data, task.data, task.len);
+            task_queue_push(ctx->send_q, &out);
         }
     }
 
