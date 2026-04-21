@@ -14,6 +14,7 @@ session_t *session_alloc(session_pool_t *pool)
             pool->items[i].state = SESS_STATE_CONNECTING;
             pool->items[i].id = pool->next_id++;
             if (pool->next_id == 0) pool->next_id = 1;
+            pool->items[i].rto = RETRANSMIT_TIMEOUT_MS;
             return &pool->items[i];
         }
     }

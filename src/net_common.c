@@ -52,6 +52,16 @@ socket_t net_udp_socket(const char *bind_addr, uint16_t port)
         closesocket(fd);
         return NET_INVALID_SOCKET;
     }
+
+    int sndbuf = 1048576;
+    int rcvbuf = 1048576;
+#ifdef _WIN32
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+#else
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#endif
     return fd;
 }
 

@@ -15,6 +15,8 @@
     #include <time.h>
 #endif
 
+#define NUM_WORKERS 4
+
 static uint64_t get_time_ms(void)
 {
 #ifdef _WIN32
@@ -130,6 +132,91 @@ static int send_msg(socket_t fd, const net_addr_t *dest, const crypto_keys_t *ke
     return (n == (int)packet_len) ? 0 : -1;
 }
 
+static void handle_ack(session_t *s, uint16_t ack_seq, uint64_t now,
+                       task_queue_t **qs, const net_addr_t *dest,
+                       const crypto_keys_t *keys, socket_t udp_fd,
+                       const char *label)
+{
+    (void)keys;
+    (void)udp_fd;
+    if (s->state != SESS_STATE_ESTABLISHED) return;
+
+    if (ack_seq == s->last_ack_seq) {
+        s->dup_ack_count++;
+        if (s->dup_ack_count >= 3 && !s->fast_retransmit_triggered) {
+            int idx = ack_seq % SEND_WND_SIZE;
+            if (s->send_pkts[idx].len > 0 && s->send_pkts[idx].seq == ack_seq) {
+                task_t task;
+                memset(&task, 0, sizeof(task));
+                task.type = TASK_ENCRYPT_AND_SEND;
+                task.session_id = s->id;
+                task.seq = ack_seq;
+                task.len = s->send_pkts[idx].len;
+                memcpy(task.data, s->send_pkts[idx].payload, task.len);
+                task.udp_dest = *dest;
+                task.tcp_fd = NET_INVALID_SOCKET;
+                task_queue_push(qs[s->id % NUM_WORKERS], &task);
+                s->send_pkts[idx].send_time_ms = now;
+                s->fast_retransmit_triggered = 1;
+                fprintf(stderr, "[%s] fast retransmit session=%u seq=%u\n", label, s->id, ack_seq);
+            }
+        }
+    } else if ((int16_t)(ack_seq - s->last_ack_seq) > 0) {
+        /* New ACK - update RTT */
+        uint64_t oldest_send_time = 0;
+        int found = 0;
+        uint16_t candidate_seq = 0;
+        for (int k = 0; k < SEND_WND_SIZE; k++) {
+            if (s->send_pkts[k].len > 0 &&
+                (int16_t)(s->send_pkts[k].seq - ack_seq) < 0 &&
+                (int16_t)(s->send_pkts[k].seq - s->last_ack_seq) >= 0) {
+                if (!found || (int16_t)(s->send_pkts[k].seq - candidate_seq) < 0) {
+                    oldest_send_time = s->send_pkts[k].send_time_ms;
+                    candidate_seq = s->send_pkts[k].seq;
+                    found = 1;
+                }
+            }
+        }
+
+        if (found) {
+            uint64_t sample = now - oldest_send_time;
+            if (sample > 0 && sample < 10000) {
+                if (!s->rtt_initialized) {
+                    s->srtt = sample;
+                    s->rttvar = sample / 2;
+                    s->rtt_initialized = 1;
+                } else {
+                    s->srtt = (s->srtt * 7 + sample) / 8;
+                    uint64_t diff = (s->srtt > sample) ? (s->srtt - sample) : (sample - s->srtt);
+                    s->rttvar = (s->rttvar * 3 + diff) / 4;
+                }
+                s->rto = s->srtt + 4 * s->rttvar;
+                if (s->rto < 100) s->rto = 100;
+                if (s->rto > 2000) s->rto = 2000;
+            }
+        }
+
+        s->last_ack_seq = ack_seq;
+        s->dup_ack_count = 0;
+        s->fast_retransmit_triggered = 0;
+    }
+
+    int cleared = 0;
+    for (int k = 0; k < SEND_WND_SIZE; k++) {
+        if (s->send_pkts[k].len > 0) {
+            if ((int16_t)(s->send_pkts[k].seq - ack_seq) < 0) {
+                s->send_pkts[k].len = 0;
+                s->send_pkt_count--;
+                cleared++;
+            }
+        }
+    }
+
+    fprintf(stderr, "[%s] SESSION_ACK session=%u ack_seq=%u cleared=%d window=%d rto=%llu\n",
+            label, s->id, ack_seq, cleared, s->send_pkt_count,
+            (unsigned long long)s->rto);
+}
+
 int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
 {
     socket_t fd = net_udp_socket("0.0.0.0", 0);
@@ -158,7 +245,6 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
     }
     session_pool_init(sessions);
 
-#define NUM_WORKERS 4
     task_queue_t *qs[NUM_WORKERS];
     for (int w = 0; w < NUM_WORKERS; w++) qs[w] = NULL;
 
@@ -390,25 +476,18 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                     }
                 } else if (msg.type == MSG_SESSION_ACK) {
                     session_t *s = session_find(sessions, msg.session_id);
-                    if (s && s->state == SESS_STATE_ESTABLISHED) {
+                    if (s) {
                         uint16_t ack_seq = (uint16_t)msg.seq;
-                        int cleared = 0;
-                        for (int k = 0; k < SEND_WND_SIZE; k++) {
-                            if (s->send_pkts[k].len > 0) {
-                                if ((int16_t)(s->send_pkts[k].seq - ack_seq) < 0) {
-                                    s->send_pkts[k].len = 0;
-                                    s->send_pkt_count--;
-                                    cleared++;
-                                }
-                            }
-                        }
-                        fprintf(stderr, "[client] SESSION_ACK recv session=%u ack_seq=%u cleared=%d window=%d\n",
-                                s->id, ack_seq, cleared, s->send_pkt_count);
+                        handle_ack(s, ack_seq, now, qs, &server_addr, keys, fd, "client");
                     }
                 } else if (msg.type == MSG_SESSION_DATA) {
                     session_t *s = session_find(sessions, msg.session_id);
                     if (!s) continue;
                     uint16_t seq = (uint16_t)msg.seq;
+                    uint16_t piggyback_ack = (uint16_t)(msg.seq >> 16);
+                    if (piggyback_ack != 0) {
+                        handle_ack(s, piggyback_ack, now, qs, &server_addr, keys, fd, "client");
+                    }
                     fprintf(stderr, "[client] SESSION_DATA recv session=%u seq=%u rx_next=%u state=%d\n",
                             s->id, seq, s->rx_next_seq, s->state);
                     int need_ack = 0;
@@ -464,14 +543,11 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                         need_ack = 1;
                     }
                     if (need_ack) {
-                        msg_t ack_msg;
-                        ack_msg.type = MSG_SESSION_ACK;
-                        ack_msg.session_id = s->id;
-                        ack_msg.seq = s->rx_next_seq;
-                        ack_msg.payload = NULL;
-                        ack_msg.payload_len = 0;
-                        fprintf(stderr, "[client] sending ACK session=%u ack_seq=%u\n", s->id, s->rx_next_seq);
-                        send_msg(fd, &server_addr, keys, &ack_msg);
+                        if (!s->pending_ack) {
+                            s->pending_ack_time_ms = now;
+                        }
+                        s->pending_ack = 1;
+                        s->pending_ack_seq = s->rx_next_seq;
                     }
                 }
                 }  /* end while(1) drain UDP */
@@ -530,7 +606,7 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                         }
                     }
                     if (s && s->state == SESS_STATE_ESTABLISHED && (fds[i].revents & POLLIN)) {
-                        if (s->send_pkt_count < SEND_WND_SIZE) {
+                        while (s->send_pkt_count < SEND_WND_SIZE) {
                             char buf[MAX_PAYLOAD_LEN];
                             int n = recv(fds[i].fd, buf, sizeof(buf), 0);
                             if (n > 0) {
@@ -553,17 +629,26 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                                 memcpy(task.data, buf, task.len);
                                 task.udp_dest = server_addr;
                                 task.tcp_fd = NET_INVALID_SOCKET;
+                                if (s->pending_ack) {
+                                    task.has_ack = 1;
+                                    task.ack_seq = s->pending_ack_seq;
+                                    s->pending_ack = 0;
+                                }
                                 task_queue_push(qs[task.session_id % NUM_WORKERS], &task);
-                            } else if (n == 0 || (n < 0 && !net_would_block(net_error()))) {
-                                printf("[client] session %u local disconnected\n", s->id);
-                                msg_t close_msg;
-                                close_msg.type = MSG_SESSION_CLOSE;
-                                close_msg.session_id = s->id;
-                                close_msg.seq = 0;
-                                close_msg.payload = NULL;
-                                close_msg.payload_len = 0;
-                                send_msg(fd, &server_addr, keys, &close_msg);
-                                session_free(sessions, s);
+                            } else {
+                                if (n < 0 && net_would_block(net_error())) break;
+                                if (n == 0 || (n < 0 && !net_would_block(net_error()))) {
+                                    printf("[client] session %u local disconnected\n", s->id);
+                                    msg_t close_msg;
+                                    close_msg.type = MSG_SESSION_CLOSE;
+                                    close_msg.session_id = s->id;
+                                    close_msg.seq = 0;
+                                    close_msg.payload = NULL;
+                                    close_msg.payload_len = 0;
+                                    send_msg(fd, &server_addr, keys, &close_msg);
+                                    session_free(sessions, s);
+                                }
+                                break;
                             }
                         }
                     }
@@ -580,7 +665,8 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                     uint16_t pkt_seq = s->send_pkts[j].seq;
                     int16_t diff = (int16_t)(s->tx_next_seq - pkt_seq);
                     if (diff > 0 && diff <= SEND_WND_SIZE) {
-                        if ((now - s->send_pkts[j].send_time_ms) > RETRANSMIT_TIMEOUT_MS) {
+                        uint64_t rto = s->rto ? s->rto : RETRANSMIT_TIMEOUT_MS;
+                        if ((now - s->send_pkts[j].send_time_ms) > rto) {
                             s->send_pkts[j].retries++;
                             if (s->send_pkts[j].retries > MAX_RETRANSMIT_RETRIES) {
                                 fprintf(stderr, "[client] session %u max retransmits exceeded\n", s->id);
@@ -612,6 +698,23 @@ int client_run(const app_config_t *cfg, const crypto_keys_t *keys)
                         s->send_pkt_count--;
                     }
                 }
+            }
+        }
+
+        /* Delayed ACK scan */
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &sessions->items[i];
+            if (s->state != SESS_STATE_ESTABLISHED) continue;
+            if (s->pending_ack && (now - s->pending_ack_time_ms) > 50) {
+                msg_t ack_msg;
+                ack_msg.type = MSG_SESSION_ACK;
+                ack_msg.session_id = s->id;
+                ack_msg.seq = s->pending_ack_seq;
+                ack_msg.payload = NULL;
+                ack_msg.payload_len = 0;
+                fprintf(stderr, "[client] delayed ACK session=%u ack_seq=%u\n", s->id, s->pending_ack_seq);
+                send_msg(fd, &server_addr, keys, &ack_msg);
+                s->pending_ack = 0;
             }
         }
 

@@ -5,8 +5,8 @@
 #include <stdint.h>
 
 #define MAX_SESSIONS 256
-#define SEND_WND_SIZE 32
-#define RECV_WND_SIZE 32
+#define SEND_WND_SIZE 128
+#define RECV_WND_SIZE 128
 #define MAX_PAYLOAD_LEN 1400
 #define RETRANSMIT_TIMEOUT_MS 400
 #define MAX_RETRANSMIT_RETRIES 10
@@ -51,6 +51,22 @@ typedef struct {
     send_wnd_pkt_t send_pkts[SEND_WND_SIZE];
     int send_pkt_count;
     recv_wnd_slot_t recv_slots[RECV_WND_SIZE];
+
+    /* Phase 2: Fast Retransmit */
+    uint16_t last_ack_seq;
+    int dup_ack_count;
+    int fast_retransmit_triggered;
+
+    /* Phase 2: Adaptive RTT */
+    uint64_t srtt;
+    uint64_t rttvar;
+    uint64_t rto;
+    int rtt_initialized;
+
+    /* Phase 2: ACK Piggybacking */
+    int pending_ack;
+    uint16_t pending_ack_seq;
+    uint64_t pending_ack_time_ms;
 } session_t;
 
 typedef struct {

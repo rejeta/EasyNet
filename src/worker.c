@@ -18,7 +18,11 @@ void *worker_thread(void *arg)
             msg_t msg;
             msg.type = MSG_SESSION_DATA;
             msg.session_id = task.session_id;
-            msg.seq = task.seq;
+            if (task.has_ack) {
+                msg.seq = ((uint32_t)task.ack_seq << 16) | task.seq;
+            } else {
+                msg.seq = task.seq;
+            }
             msg.payload = (const uint8_t *)task.data;
             msg.payload_len = task.len;
 
